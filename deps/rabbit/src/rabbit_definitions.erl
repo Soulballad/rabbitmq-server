@@ -216,7 +216,9 @@ all_definitions() ->
 
 -spec has_configured_definitions_to_load() -> boolean().
 has_configured_definitions_to_load() ->
-    has_configured_definitions_to_load_via_classic_option() or has_configured_definitions_to_load_via_modern_option().
+    has_configured_definitions_to_load_via_classic_option() or
+        has_configured_definitions_to_load_via_modern_option() or
+        has_configured_definitions_to_load_via_management_option().
 
 %% Retained for backwards compatibility, implicitly assumes the local filesystem source
 maybe_load_definitions(App, Key) ->
@@ -240,6 +242,13 @@ has_configured_definitions_to_load_via_modern_option() ->
 
 has_configured_definitions_to_load_via_classic_option() ->
     case application:get_env(rabbit, load_definitions) of
+        undefined   -> false;
+        {ok, none}  -> false;
+        {ok, _Path} -> true
+    end.
+
+has_configured_definitions_to_load_via_management_option() ->
+    case application:get_env(rabbitmq_management, load_definitions) of
         undefined   -> false;
         {ok, none}  -> false;
         {ok, _Path} -> true
@@ -651,8 +660,9 @@ add_vhost(VHost, ActingUser) ->
     Metadata         = rabbit_data_coercion:atomize_keys(maps:get(metadata, VHost, #{})),
     Description      = maps:get(description, VHost, maps:get(description, Metadata, <<"">>)),
     Tags             = maps:get(tags, VHost, maps:get(tags, Metadata, [])),
+    DefaultQueueType = maps:get(default_queue_type, Metadata, undefined),
 
-    rabbit_vhost:put_vhost(Name, Description, Tags, IsTracingEnabled, ActingUser).
+    rabbit_vhost:put_vhost(Name, Description, Tags, DefaultQueueType, IsTracingEnabled, ActingUser).
 
 add_permission(Permission, ActingUser) ->
     rabbit_auth_backend_internal:set_permissions(maps:get(user,      Permission, undefined),
@@ -839,7 +849,8 @@ list_exchanges() ->
     %% applications
     [exchange_definition(X) || X <- lists:filter(fun(#exchange{internal = true}) -> false;
                                                     (#exchange{name = #resource{name = <<>>}}) -> false;
-                                                    (X) -> not rabbit_exchange:is_amq_prefixed(X)
+                                                    (#exchange{name = #resource{name = <<"amq.", _Rest/binary>>}}) -> false;
+                                                    (_) -> true
                                                  end,
                                                  rabbit_exchange:list())].
 

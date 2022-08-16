@@ -1315,7 +1315,7 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
                      SeqNo = State0#ch.publish_seqno,
                      {SeqNo, State0#ch{publish_seqno = SeqNo + 1}}
         end,
-    case rabbit_basic:message(ExchangeName, RoutingKey, DecodedContent) of
+    case rabbit_basic:message_no_id(ExchangeName, RoutingKey, DecodedContent) of
         {ok, Message} ->
             Delivery = rabbit_basic:delivery(
                          Mandatory, DoConfirm, Message, MsgSeqNo),
@@ -2519,13 +2519,18 @@ handle_method(#'queue.declare'{queue       = QueueNameBin,
                                exclusive   = ExclusiveDeclare,
                                auto_delete = AutoDelete,
                                nowait      = NoWait,
-                               arguments   = Args} = Declare,
+                               arguments   = Args0} = Declare,
               ConnPid, AuthzContext, CollectorPid, VHostPath,
               #user{username = Username} = User) ->
     Owner = case ExclusiveDeclare of
                 true  -> ConnPid;
                 false -> none
             end,
+    Args = rabbit_amqqueue:augment_declare_args(VHostPath,
+                                                DurableDeclare,
+                                                ExclusiveDeclare,
+                                                AutoDelete,
+                                                Args0),
     StrippedQueueNameBin = strip_cr_lf(QueueNameBin),
     Durable = DurableDeclare andalso not ExclusiveDeclare,
     ActualNameBin = case StrippedQueueNameBin of
@@ -2886,7 +2891,9 @@ find_queue_name_from_quorum_name(Name, QStates) ->
                           amqqueue:get_name(Q);
                       _ ->
                           undefined
-                  end
+                  end;
+             (_, _, Acc) ->
+                  Acc
           end,
     rabbit_queue_type:fold_state(Fun, undefined, QStates).
 

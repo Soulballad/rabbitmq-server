@@ -88,7 +88,8 @@
          transport :: tcp | ssl,
          proxy_socket :: undefined | ranch_proxy:proxy_socket(),
          correlation_id_sequence :: integer(),
-         outstanding_requests :: #{integer() => term()}}).
+         outstanding_requests :: #{integer() => term()},
+         deliver_version :: rabbit_stream_core:command_version()}).
 -record(configuration,
         {initial_credits :: integer(),
          credits_required_for_unblocking :: integer(),
@@ -218,6 +219,7 @@ init([KeepaliveSup,
             {PeerHost, PeerPort, Host, Port} =
                 socket_op(Sock,
                           fun(S) -> rabbit_net:socket_ends(S, inbound) end),
+            DeliverVersion = ?VERSION_1,
             Connection =
                 #stream_connection{name =
                                        rabbit_data_coercion:to_binary(ConnStr),
@@ -243,7 +245,8 @@ init([KeepaliveSup,
                                    proxy_socket =
                                        rabbit_net:maybe_get_proxy_socket(Sock),
                                    correlation_id_sequence = 0,
-                                   outstanding_requests = #{}},
+                                   outstanding_requests = #{},
+                                   deliver_version = DeliverVersion},
             State =
                 #stream_connection_state{consumers = #{},
                                          blocked = false,
@@ -490,8 +493,8 @@ handle_info(Msg,
                                          NewConnectionStep]),
             Transition(NewConnectionStep, StatemData, Connection1, State1);
         {Closed, S} ->
-            rabbit_log_connection:warning("Stream protocol connection socket ~w closed",
-                                          [S]),
+            rabbit_log_connection:debug("Stream protocol connection socket ~w closed",
+                                        [S]),
             stop;
         {Error, S, Reason} ->
             rabbit_log_connection:warning("Socket error ~p [~w]", [Reason, S]),
@@ -819,11 +822,11 @@ open(info,
 
                         Conn1 =
                             maybe_send_consumer_update(Transport,
-                                                  Connection0,
-                                                  SubId,
-                                                  Active,
-                                                  true,
-                                                  Extra),
+                                                       Connection0,
+                                                       SubId,
+                                                       Active,
+                                                       true,
+                                                       Extra),
                         {Conn1,
                          ConnState0#stream_connection_state{consumers =
                                                                 Consumers0#{SubId
@@ -1057,7 +1060,8 @@ open(cast,
                   connection =
                       #stream_connection{stream_subscriptions =
                                              StreamSubscriptions,
-                                         send_file_oct = SendFileOct} =
+                                         send_file_oct = SendFileOct,
+                                         deliver_version = DeliverVersion} =
                           Connection,
                   connection_state =
                       #stream_connection_state{consumers = Consumers} = State} =
@@ -1091,7 +1095,8 @@ open(cast,
                                                Consumer; %% SAC not active
                                            {0, _} -> Consumer;
                                            {_, _} ->
-                                               case send_chunks(Transport,
+                                               case send_chunks(DeliverVersion,
+                                                                Transport,
                                                                 Consumer,
                                                                 SendFileOct)
                                                of
@@ -1729,7 +1734,6 @@ handle_frame_post_auth(Transport,
                        State,
                        {request, CorrelationId,
                         {query_publisher_sequence, Reference, Stream}}) ->
-    % FrameSize = ?RESPONSE_FRAME_SIZE + 8,
     {ResponseCode, Sequence} =
         case rabbit_stream_utils:check_read_permitted(#resource{name = Stream,
                                                                 kind = queue,
@@ -1738,18 +1742,15 @@ handle_frame_post_auth(Transport,
                                                       User, #{})
         of
             ok ->
-                case rabbit_stream_manager:lookup_local_member(VirtualHost,
-                                                               Stream)
-                of
+                case rabbit_stream_manager:lookup_leader(VirtualHost, Stream) of
                     {error, not_found} ->
                         rabbit_global_counters:increase_protocol_counter(stream,
                                                                          ?STREAM_DOES_NOT_EXIST,
                                                                          1),
                         {?RESPONSE_CODE_STREAM_DOES_NOT_EXIST, 0};
-                    {ok, LocalMemberPid} ->
+                    {ok, LeaderPid} ->
                         {?RESPONSE_CODE_OK,
-                         case osiris:fetch_writer_seq(LocalMemberPid, Reference)
-                         of
+                         case osiris:fetch_writer_seq(LeaderPid, Reference) of
                              undefined ->
                                  0;
                              Offt ->
@@ -2007,7 +2008,8 @@ handle_frame_post_auth(Transport,
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
-                                          send_file_oct = SendFileOct} =
+                                          send_file_oct = SendFileOct,
+                                          deliver_version = DeliverVersion} =
                            Connection,
                        #stream_connection_state{consumers = Consumers} = State,
                        {credit, SubscriptionId, Credit}) ->
@@ -2030,7 +2032,8 @@ handle_frame_post_auth(Transport,
         #{SubscriptionId := Consumer} ->
             #consumer{credit = AvailableCredit, last_listener_offset = LLO} =
                 Consumer,
-            case send_chunks(Transport,
+            case send_chunks(DeliverVersion,
+                             Transport,
                              Consumer,
                              AvailableCredit + Credit,
                              LLO,
@@ -2491,7 +2494,8 @@ handle_frame_post_auth(Transport,
                        #stream_connection{transport = ConnTransport,
                                           outstanding_requests = Requests0,
                                           send_file_oct = SendFileOct,
-                                          virtual_host = VirtualHost} =
+                                          virtual_host = VirtualHost,
+                                          deliver_version = DeliverVersion} =
                            Connection,
                        #stream_connection_state{consumers = Consumers} = State,
                        {response, CorrelationId,
@@ -2551,7 +2555,10 @@ handle_frame_post_auth(Transport,
                                         OffsetSpec),
                         Consumer1 = Consumer#consumer{log = Segment},
                         Consumer2 =
-                            case send_chunks(Transport, Consumer1, SendFileOct)
+                            case send_chunks(DeliverVersion,
+                                             Transport,
+                                             Consumer1,
+                                             SendFileOct)
                             of
                                 {error, closed} ->
                                     rabbit_log_connection:info("Stream protocol connection has been closed by "
@@ -2619,6 +2626,67 @@ handle_frame_post_auth(Transport,
             {Connection, State}
     end;
 handle_frame_post_auth(Transport,
+                       #stream_connection{socket = S} = Connection0,
+                       State,
+                       {request, CorrelationId,
+                        {exchange_command_versions, CommandVersions}}) ->
+    Frame =
+        rabbit_stream_core:frame({response, CorrelationId,
+                                  {exchange_command_versions, ?RESPONSE_CODE_OK,
+                                   rabbit_stream_utils:command_versions()}}),
+    send(Transport, S, Frame),
+
+    %% adapt connection handlers to client capabilities
+    Connection1 =
+        process_client_command_versions(Connection0, CommandVersions),
+    {Connection1, State};
+handle_frame_post_auth(Transport,
+                       #stream_connection{socket = S,
+                                          virtual_host = VirtualHost,
+                                          user = User} =
+                           Connection,
+                       State,
+                       {request, CorrelationId, {stream_stats, Stream}}) ->
+    QueueResource =
+        #resource{name = Stream,
+                  kind = queue,
+                  virtual_host = VirtualHost},
+    Response =
+        case rabbit_stream_utils:check_read_permitted(QueueResource, User,
+                                                      #{})
+        of
+            ok ->
+                case rabbit_stream_manager:lookup_member(VirtualHost, Stream) of
+                    {error, not_available} ->
+                        rabbit_global_counters:increase_protocol_counter(stream,
+                                                                         ?STREAM_NOT_AVAILABLE,
+                                                                         1),
+                        {stream_stats, ?RESPONSE_CODE_STREAM_NOT_AVAILABLE,
+                         #{}};
+                    {error, not_found} ->
+                        rabbit_global_counters:increase_protocol_counter(stream,
+                                                                         ?STREAM_DOES_NOT_EXIST,
+                                                                         1),
+                        {stream_stats, ?RESPONSE_CODE_STREAM_DOES_NOT_EXIST,
+                         #{}};
+                    {ok, MemberPid} ->
+                        StreamStats =
+                            maps:fold(fun(K, V, Acc) ->
+                                         Acc#{atom_to_binary(K) => V}
+                                      end,
+                                      #{}, osiris:get_stats(MemberPid)),
+                        {stream_stats, ?RESPONSE_CODE_OK, StreamStats}
+                end;
+            error ->
+                rabbit_global_counters:increase_protocol_counter(stream,
+                                                                 ?ACCESS_REFUSED,
+                                                                 1),
+                {stream_stats, ?RESPONSE_CODE_ACCESS_REFUSED, #{}}
+        end,
+    Frame = rabbit_stream_core:frame({response, CorrelationId, Response}),
+    send(Transport, S, Frame),
+    {Connection, State};
+handle_frame_post_auth(Transport,
                        #stream_connection{socket = S} = Connection,
                        State,
                        {request, CorrelationId,
@@ -2651,6 +2719,16 @@ handle_frame_post_auth(Transport,
                                                      ?UNKNOWN_FRAME, 1),
     {Connection#stream_connection{connection_step = close_sent}, State}.
 
+process_client_command_versions(C, []) ->
+    C;
+process_client_command_versions(C, [H | T]) ->
+    process_client_command_versions(process_client_command_api(C, H), T).
+
+process_client_command_api(C, {deliver, ?VERSION_1, ?VERSION_2}) ->
+    C#stream_connection{deliver_version = ?VERSION_2};
+process_client_command_api(C, _) ->
+    C.
+
 init_reader(ConnectionTransport,
             LocalMemberPid,
             QueueResource,
@@ -2681,7 +2759,9 @@ consumer_name(_Properties) ->
 maybe_dispatch_on_subscription(Transport,
                                State,
                                ConsumerState,
-                               Connection,
+                               #stream_connection{deliver_version =
+                                                      DeliverVersion} =
+                                   Connection,
                                Consumers,
                                Stream,
                                SubscriptionId,
@@ -2690,7 +2770,11 @@ maybe_dispatch_on_subscription(Transport,
                                false = _Sac) ->
     rabbit_log:debug("Distributing existing messages to subscription ~p",
                      [SubscriptionId]),
-    case send_chunks(Transport, ConsumerState, SendFileOct) of
+    case send_chunks(DeliverVersion,
+                     Transport,
+                     ConsumerState,
+                     SendFileOct)
+    of
         {error, closed} ->
             rabbit_log_connection:info("Stream protocol connection has been closed by "
                                        "peer",
@@ -2777,15 +2861,16 @@ maybe_register_consumer(VirtualHost,
 maybe_send_consumer_update(_, Connection, _, _, false = _Sac, _) ->
     Connection;
 maybe_send_consumer_update(Transport,
-                      #stream_connection{socket = S,
-                                         correlation_id_sequence = CorrIdSeq,
-                                         outstanding_requests =
-                                             OutstandingRequests0} =
-                          Connection,
-                      SubscriptionId,
-                      Active,
-                      true = _Sac,
-                      Extra) ->
+                           #stream_connection{socket = S,
+                                              correlation_id_sequence =
+                                                  CorrIdSeq,
+                                              outstanding_requests =
+                                                  OutstandingRequests0} =
+                               Connection,
+                           SubscriptionId,
+                           Active,
+                           true = _Sac,
+                           Extra) ->
     rabbit_log:debug("SAC subscription ~p, active = ~p",
                      [SubscriptionId, Active]),
     Frame =
@@ -3112,7 +3197,9 @@ subscription_exists(StreamSubscriptions, SubscriptionId) ->
             maps:values(StreamSubscriptions)),
     lists:any(fun(Id) -> Id =:= SubscriptionId end, SubscriptionIds).
 
-send_file_callback(Transport,
+send_file_callback(?VERSION_1,
+                   Transport,
+                   _Log,
                    #consumer{configuration =
                                  #consumer_configuration{socket = S,
                                                          subscription_id =
@@ -3132,23 +3219,65 @@ send_file_callback(Transport,
        atomics:add(Counter, 1, Size),
        increase_messages_consumed(Counters, NumEntries),
        set_consumer_offset(Counters, FirstOffsetInChunk)
+    end;
+send_file_callback(?VERSION_2,
+                   Transport,
+                   Log,
+                   #consumer{configuration =
+                                 #consumer_configuration{socket = S,
+                                                         subscription_id =
+                                                             SubscriptionId,
+                                                         counters = Counters}},
+                   Counter) ->
+    fun(#{chunk_id := FirstOffsetInChunk, num_entries := NumEntries},
+        Size) ->
+       FrameSize = 2 + 2 + 1 + 8 + Size,
+       CommittedChunkId =
+           case osiris_log:committed_offset(Log) of
+               undefined -> 0;
+               R -> R
+           end,
+       FrameBeginning =
+           <<FrameSize:32,
+             ?REQUEST:1,
+             ?COMMAND_DELIVER:15,
+             ?VERSION_2:16,
+             SubscriptionId:8/unsigned,
+             CommittedChunkId:64>>,
+       Transport:send(S, FrameBeginning),
+       atomics:add(Counter, 1, Size),
+       increase_messages_consumed(Counters, NumEntries),
+       set_consumer_offset(Counters, FirstOffsetInChunk)
     end.
 
-send_chunks(Transport,
+send_chunks(DeliverVersion,
+            Transport,
             #consumer{credit = Credit, last_listener_offset = LastLstOffset} =
                 Consumer,
             Counter) ->
-    send_chunks(Transport, Consumer, Credit, LastLstOffset, Counter).
+    send_chunks(DeliverVersion,
+                Transport,
+                Consumer,
+                Credit,
+                LastLstOffset,
+                Counter).
 
-send_chunks(_Transport, Consumer, 0, LastLstOffset, _Counter) ->
+send_chunks(_DeliverVersion,
+            _Transport,
+            Consumer,
+            0,
+            LastLstOffset,
+            _Counter) ->
     {ok,
      Consumer#consumer{credit = 0, last_listener_offset = LastLstOffset}};
-send_chunks(Transport,
+send_chunks(DeliverVersion,
+            Transport,
             #consumer{log = Log} = Consumer,
             Credit,
             LastLstOffset,
             Counter) ->
-    send_chunks(Transport,
+    send_chunks(DeliverVersion,
+                Transport,
                 Consumer,
                 Log,
                 Credit,
@@ -3156,7 +3285,8 @@ send_chunks(Transport,
                 true,
                 Counter).
 
-send_chunks(_Transport,
+send_chunks(_DeliverVersion,
+            _Transport,
             Consumer,
             Log,
             0 = _Credit,
@@ -3167,7 +3297,8 @@ send_chunks(_Transport,
      Consumer#consumer{log = Log,
                        credit = 0,
                        last_listener_offset = LastLstOffset}};
-send_chunks(Transport,
+send_chunks(DeliverVersion,
+            Transport,
             #consumer{configuration = #consumer_configuration{socket = S}} =
                 Consumer,
             Log,
@@ -3176,10 +3307,15 @@ send_chunks(Transport,
             Retry,
             Counter) ->
     case osiris_log:send_file(S, Log,
-                              send_file_callback(Transport, Consumer, Counter))
+                              send_file_callback(DeliverVersion,
+                                                 Transport,
+                                                 Log,
+                                                 Consumer,
+                                                 Counter))
     of
         {ok, Log1} ->
-            send_chunks(Transport,
+            send_chunks(DeliverVersion,
+                        Transport,
                         Consumer,
                         Log1,
                         Credit - 1,
@@ -3196,7 +3332,8 @@ send_chunks(Transport,
             case Retry of
                 true ->
                     timer:sleep(1),
-                    send_chunks(Transport,
+                    send_chunks(DeliverVersion,
+                                Transport,
                                 Consumer,
                                 Log1,
                                 Credit,

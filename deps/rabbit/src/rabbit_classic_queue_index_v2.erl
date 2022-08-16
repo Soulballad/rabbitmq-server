@@ -982,7 +982,7 @@ read_from_disk(SeqIdsToRead0, State0 = #qi{ write_buffer = WriteBuffer }, Acc0) 
                     %% We reached the end of a partial file.
                     %% Everything past that point is non-existent.
                     %% This probably does not happen outside of tests.
-                    read_from_disk(SeqIdsToRead, State0, Acc0)
+                    read_from_disk(SeqIdsToRead, State, Acc0)
             end;
         %% The segment file no longer exists. This is equivalent to a file
         %% where all entries are non-existent/acked. This can happen after
@@ -1127,7 +1127,7 @@ queue_index_walker_reader(#resource{ virtual_host = VHost } = Name, Gatherer) ->
     _ = [queue_index_walker_segment(filename:join(Dir, F), Gatherer) || F <- SegmentFiles],
     %% When there are files belonging to the v1 index, we go through
     %% the v1 index walker function as well.
-    case rabbit_file:wildcard(".*\\.idx", Dir) of
+    case rabbit_file:wildcard(".*\\.(idx|jif)", Dir) of
         [_|_] ->
             %% This function will call gatherer:finish/1, we do not
             %% need to call it here.

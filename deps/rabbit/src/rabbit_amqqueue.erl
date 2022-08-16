@@ -17,6 +17,7 @@
          not_found_or_absent/1, not_found_or_absent_dirty/1,
          with/2, with/3, with_or_die/2,
          assert_equivalence/5,
+         augment_declare_args/5,
          check_exclusive_access/2, with_exclusive_access_or_die/3,
          stat/1, deliver/2,
          requeue/3, ack/3, reject/4]).
@@ -163,11 +164,6 @@ start(Qs) ->
     ok.
 
 mark_local_durable_queues_stopped(VHost) ->
-    ?try_mnesia_tx_or_upgrade_amqqueue_and_retry(
-       do_mark_local_durable_queues_stopped(VHost),
-       do_mark_local_durable_queues_stopped(VHost)).
-
-do_mark_local_durable_queues_stopped(VHost) ->
     Qs = find_local_durable_queues(VHost),
     rabbit_misc:execute_mnesia_transaction(
         fun() ->
@@ -257,12 +253,7 @@ get_queue_type(Args) ->
     {created | existing, amqqueue:amqqueue()} | queue_absent().
 
 internal_declare(Q, Recover) ->
-    ?try_mnesia_tx_or_upgrade_amqqueue_and_retry(
-        do_internal_declare(Q, Recover),
-        begin
-            Q1 = amqqueue:upgrade(Q),
-            do_internal_declare(Q1, Recover)
-        end).
+    do_internal_declare(Q, Recover).
 
 do_internal_declare(Q, true) ->
     rabbit_misc:execute_mnesia_tx_with_tail(
@@ -310,14 +301,6 @@ update(Name, Fun) ->
 %% only really used for quorum queues to ensure the rabbit_queue record
 %% is initialised
 ensure_rabbit_queue_record_is_initialized(Q) ->
-    ?try_mnesia_tx_or_upgrade_amqqueue_and_retry(
-       do_ensure_rabbit_queue_record_is_initialized(Q),
-       begin
-           Q1 = amqqueue:upgrade(Q),
-           do_ensure_rabbit_queue_record_is_initialized(Q1)
-       end).
-
-do_ensure_rabbit_queue_record_is_initialized(Q) ->
     rabbit_misc:execute_mnesia_tx_with_tail(
       fun () ->
               ok = store_queue(Q),
@@ -729,6 +712,36 @@ assert_equivalence(Q, DurableDeclare, AutoDeleteDeclare, Args1, Owner) ->
     ok = rabbit_misc:assert_field_equivalence(AutoDeleteQ, AutoDeleteDeclare, QName, auto_delete),
     ok = assert_args_equivalence(Q, Args1).
 
+-spec augment_declare_args(vhost:name(), boolean(),
+                           boolean(), boolean(),
+                           rabbit_framing:amqp_table()) ->
+    rabbit_framing:amqp_table().
+augment_declare_args(VHost, Durable, Exclusive, AutoDelete, Args0) ->
+    V = rabbit_vhost:lookup(VHost),
+    HasQTypeArg = rabbit_misc:table_lookup(Args0, <<"x-queue-type">>) =/= undefined,
+    case vhost:get_metadata(V) of
+        #{default_queue_type := DefaultQueueType}
+          when is_binary(DefaultQueueType) andalso
+               not HasQTypeArg ->
+            Type = rabbit_queue_type:discover(DefaultQueueType),
+            case rabbit_queue_type:is_compatible(Type, Durable,
+                                                 Exclusive, AutoDelete) of
+                true ->
+                    %% patch up declare arguments with x-queue-type if there
+                    %% is a vhost default set the queue is druable and not exclusive
+                    %% and there is no queue type argument
+                    %% present
+                    rabbit_misc:set_table_value(Args0,
+                                                <<"x-queue-type">>,
+                                                longstr,
+                                                DefaultQueueType);
+                false ->
+                    Args0
+            end;
+        _ ->
+            Args0
+    end.
+
 -spec check_exclusive_access(amqqueue:amqqueue(), pid()) ->
           'ok' | rabbit_types:channel_exit().
 
@@ -1089,7 +1102,13 @@ list() ->
     list_with_possible_retry(fun do_list/0).
 
 do_list() ->
-    mnesia:dirty_match_object(rabbit_queue, amqqueue:pattern_match_all()).
+    All = mnesia:dirty_match_object(rabbit_queue, amqqueue:pattern_match_all()),
+    NodesRunning = rabbit_nodes:all_running(),
+    lists:filter(fun (Q) ->
+                         Pid = amqqueue:get_pid(Q),
+                         St = amqqueue:get_state(Q),
+                         St =/= stopped orelse lists:member(node(Pid), NodesRunning)
+                 end, All).
 
 -spec count() -> non_neg_integer().
 
@@ -1269,7 +1288,13 @@ is_in_virtual_host(Q, VHostName) ->
 
 -spec list(vhost:name()) -> [amqqueue:amqqueue()].
 list(VHostPath) ->
-    list(VHostPath, rabbit_queue).
+    All = list(VHostPath, rabbit_queue),
+    NodesRunning = rabbit_nodes:all_running(),
+    lists:filter(fun (Q) ->
+                         Pid = amqqueue:get_pid(Q),
+                         St = amqqueue:get_state(Q),
+                         St =/= stopped orelse lists:member(node(Pid), NodesRunning)
+                 end, All).
 
 list(VHostPath, TableName) ->
     list_with_possible_retry(fun() -> do_list(VHostPath, TableName) end).
@@ -1323,13 +1348,17 @@ list_down(VHostPath) ->
     case rabbit_vhost:exists(VHostPath) of
         false -> [];
         true  ->
-            Present = list(VHostPath),
+            Alive = sets:from_list([amqqueue:get_name(Q) || Q <- list(VHostPath)]),
             Durable = list(VHostPath, rabbit_durable_queue),
-            PresentS = sets:from_list([amqqueue:get_name(Q) || Q <- Present]),
-            sets:to_list(sets:filter(fun (Q) ->
-                                             N = amqqueue:get_name(Q),
-                                             not sets:is_element(N, PresentS)
-                                     end, sets:from_list(Durable)))
+            NodesRunning = rabbit_nodes:all_running(),
+            lists:filter(fun (Q) ->
+                                 N = amqqueue:get_name(Q),
+                                 Pid = amqqueue:get_pid(Q),
+                                 St = amqqueue:get_state(Q),
+                                 (St =:= stopped andalso not lists:member(node(Pid), NodesRunning))
+                                 orelse
+                                 (not sets:is_element(N, Alive))
+                         end, Durable)
     end.
 
 count(VHost) ->
@@ -2023,6 +2052,7 @@ queues_to_delete_when_node_down(NodeDown) ->
             Q <- mnesia:table(rabbit_queue),
                 amqqueue:qnode(Q) == NodeDown andalso
                 not rabbit_mnesia:is_process_alive(amqqueue:get_pid(Q)) andalso
+                (not amqqueue:is_classic(Q) orelse not amqqueue:is_durable(Q)) andalso
                 (not rabbit_amqqueue:is_replicated(Q) orelse
                 rabbit_amqqueue:is_dead_exclusive(Q))]
         ))
@@ -2090,23 +2120,43 @@ get_quorum_nodes(Q) ->
             []
     end.
 
--spec prepend_extra_bcc([amqqueue:amqqueue()]) -> [amqqueue:amqqueue()].
+-spec prepend_extra_bcc([amqqueue:amqqueue()]) ->
+    [amqqueue:amqqueue()].
 prepend_extra_bcc([]) ->
     [];
 prepend_extra_bcc([Q] = Qs) ->
-    prepend_extra_bcc(Q, Qs);
-prepend_extra_bcc(Qs) ->
-    lists:foldl(fun(Q, Acc) ->
-                        prepend_extra_bcc(Q, Acc)
-                end, Qs, Qs).
-
-prepend_extra_bcc(Q, Qs) ->
     case amqqueue:get_options(Q) of
-        #{extra_bcc := BCC} ->
-            #resource{virtual_host = VHost} = amqqueue:get_name(Q),
-            BCCQueueName = rabbit_misc:r(VHost, queue, BCC),
-            BCCQueue = rabbit_amqqueue:lookup([BCCQueueName]),
-            BCCQueue ++ Qs;
+        #{extra_bcc := BCCName} ->
+            case get_bcc_queue(Q, BCCName) of
+                {ok, BCCQueue} ->
+                    [BCCQueue | Qs];
+                {error, not_found} ->
+                    Qs
+            end;
         _ ->
             Qs
-    end.
+    end;
+prepend_extra_bcc(Qs) ->
+    BCCQueues =
+        lists:filtermap(
+          fun(Q) ->
+                  case amqqueue:get_options(Q) of
+                      #{extra_bcc := BCCName} ->
+                          case get_bcc_queue(Q, BCCName) of
+                              {ok, BCCQ} ->
+                                  {true, BCCQ};
+                              {error, not_found} ->
+                                  false
+                          end;
+                      _ ->
+                          false
+                  end
+          end, Qs),
+    lists:usort(BCCQueues) ++ Qs.
+
+-spec get_bcc_queue(amqqueue:amqqueue(), binary()) ->
+    {ok, amqqueue:amqqueue()} | {error, not_found}.
+get_bcc_queue(Q, BCCName) ->
+    #resource{virtual_host = VHost} = amqqueue:get_name(Q),
+    BCCQueueName = rabbit_misc:r(VHost, queue, BCCName),
+    rabbit_amqqueue:lookup(BCCQueueName).

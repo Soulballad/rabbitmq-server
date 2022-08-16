@@ -91,6 +91,7 @@ set_default_config() ->
                #{domain => ?RMQLOG_DOMAIN_PRELAUNCH}),
     OsirisConfig =
         case osiris_util:get_replication_configuration_from_tls_dist(
+                fun rabbit_prelaunch_file:consult_file/1,
                 fun osiris_log/3) of
             [] ->
                 [];
@@ -201,7 +202,7 @@ determine_config_format(File) ->
         0 ->
             cuttlefish;
         _ ->
-            case file:consult(File) of
+            case rabbit_prelaunch_file:consult_file(File) of
                 {ok, _} -> erlang;
                 _       -> cuttlefish
             end
@@ -384,7 +385,7 @@ override_with_advanced_config(Config, AdvancedConfigFile) ->
       "Override with advanced configuration file \"~ts\"",
       [AdvancedConfigFile],
       #{domain => ?RMQLOG_DOMAIN_PRELAUNCH}),
-    case file:consult(AdvancedConfigFile) of
+    case rabbit_prelaunch_file:consult_file(AdvancedConfigFile) of
         {ok, [AdvancedConfig]} ->
             cuttlefish_advanced:overlay(Config, AdvancedConfig);
         {ok, OtherTerms} ->

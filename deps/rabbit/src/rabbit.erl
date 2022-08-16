@@ -11,9 +11,6 @@
 -include_lib("kernel/include/logger.hrl").
 -include_lib("rabbit_common/include/logging.hrl").
 
--ignore_xref({rabbit_direct, force_event_refresh, 1}).
--ignore_xref({rabbit_networking, force_connection_event_refresh, 1}).
-
 -behaviour(application).
 
 -export([start/0, boot/0, stop/0,
@@ -73,6 +70,18 @@
 -rabbit_boot_step({database_sync,
                    [{description, "database sync"},
                     {mfa,         {rabbit_sup, start_child, [mnesia_sync]}},
+                    {requires,    database},
+                    {enables,     external_infrastructure}]}).
+
+-rabbit_boot_step({networking_metadata_store,
+                   [{description, "networking infrastructure"},
+                    {mfa,         {rabbit_sup, start_child, [rabbit_networking_store]}},
+                    {requires,    database},
+                    {enables,     external_infrastructure}]}).
+
+-rabbit_boot_step({tracking_metadata_store,
+                   [{description, "tracking infrastructure"},
+                    {mfa,         {rabbit_sup, start_child, [rabbit_tracking_store]}},
                     {requires,    database},
                     {enables,     external_infrastructure}]}).
 
@@ -390,7 +399,7 @@ start_it(StartType) ->
 
                 T1 = erlang:timestamp(),
                 ?LOG_DEBUG(
-                  "Time to start RabbitMQ: ~p µs",
+                  "Time to start RabbitMQ: ~p us",
                   [timer:now_diff(T1, T0)]),
                 stop_boot_marker(Marker),
                 ok
@@ -853,6 +862,12 @@ start(normal, []) ->
         end,
         log_motd(),
         {ok, SupPid} = rabbit_sup:start_link(),
+
+        %% When we load plugins later in this function, we refresh feature
+        %% flags. If `feature_flags_v2' is enabled, `rabbit_ff_controller'
+        %% will be used. We start it now because we can't wait for boot steps
+        %% to do this (feature flags are refreshed before boot steps run).
+        ok = rabbit_sup:start_child(rabbit_ff_controller),
 
         %% Compatibility with older RabbitMQ versions + required by
         %% rabbit_node_monitor:notify_node_up/0:
